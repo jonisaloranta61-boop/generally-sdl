@@ -1,0 +1,314 @@
+/* GeneRally SDL.dll proxy - koe 2: virtuaalikello, nauhoitus/toisto, kuvan tarkistussumma.
+   Alkuperäinen SDL.dll nimetään SDL_real.dll:ksi, tämä tiedosto on uusi SDL.dll.
+   Asetukset: tiedosto gr_net.cfg pelin kansiossa (rivit: mode=off|record|replay, seed=12345, clock=real).
+   Lokit: gr_log.txt, nauhoitus: gr_keys.txt. */
+#include <windows.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+typedef unsigned int Uint32;
+typedef unsigned char Uint8;
+#define EXP __declspec(dllexport)
+
+static HINSTANCE hSelf = 0;
+BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
+    (void)reserved;
+    if (reason == DLL_PROCESS_ATTACH) hSelf = h;
+    return TRUE;
+}
+
+static HMODULE R = 0;
+static FILE *LG = 0;
+static Uint32 (*r_GetTicks)(void);
+static void (*r_Delay)(Uint32);
+static Uint8 *(*r_GetKeyState)(int *);
+static int (*r_PollEvent)(void *);
+static void (*r_PumpEvents)(void);
+static int (*r_Flip)(void *);
+
+/* ---- asetukset ---- */
+static int MODE = 3;   /* 0 pois, 1 nauhoita, 2 toista, 3 auto (oletus) */
+static int VCLOCK = 1; /* 1 = virtuaalikello */
+static unsigned SEED = 12345;
+
+/* ---- laskurit ---- */
+static unsigned cGetTicks, cDelay, cGetKey, cPoll, cPump, cFlip;
+static unsigned cSrand, cRand, cTime, cQpc, cGst, cGstft;
+static unsigned pollIdx, frameNo;
+static unsigned S; /* globaali kutsulaskuri: nauhoitus ja toisto sidotaan siihen */
+static Uint32 V = 1000; /* virtuaaliaika ms */
+static unsigned stuck;
+static Uint8 prevKeys[512];
+static Uint8 repKeys[512];
+static DWORD lastRep;
+static unsigned delayLogged;
+
+/* ---- nauhoitus ---- */
+typedef struct { unsigned idx; int key, val; } KRec;
+typedef struct { unsigned idx; Uint8 b[20]; } ERec;
+static KRec *krec; static unsigned nk, ak, rk;
+static ERec *erec; static unsigned ne, ae, re;
+static FILE *KF;
+
+static void add_k(unsigned idx, int key, int val) {
+    if (nk == ak) { ak = ak ? ak * 2 : 4096; krec = (KRec *)realloc(krec, ak * sizeof(KRec)); }
+    krec[nk].idx = idx; krec[nk].key = key; krec[nk].val = val; nk++;
+}
+static void add_e(unsigned idx, const Uint8 *b) {
+    if (ne == ae) { ae = ae ? ae * 2 : 4096; erec = (ERec *)realloc(erec, ae * sizeof(ERec)); }
+    erec[ne].idx = idx; memcpy(erec[ne].b, b, 20); ne++;
+}
+
+static void load_cfg(void) {
+    FILE *f = fopen("gr_net.cfg", "r");
+    char line[128];
+    if (!f) return;
+    while (fgets(line, sizeof line, f)) {
+        if (!strncmp(line, "mode=off", 8)) MODE = 0;
+        else if (!strncmp(line, "mode=record", 11)) MODE = 1;
+        else if (!strncmp(line, "mode=replay", 11)) MODE = 2;
+        else if (!strncmp(line, "clock=real", 10)) VCLOCK = 0;
+        else if (!strncmp(line, "seed=", 5)) SEED = (unsigned)atoi(line + 5);
+    }
+    fclose(f);
+}
+
+static void load_replay(void) {
+    FILE *f = fopen("gr_keys.txt", "r");
+    char line[256], hex[64];
+    unsigned idx;
+    int key, val;
+    if (!f) return;
+    while (fgets(line, sizeof line, f)) {
+        if (line[0] == 'K' && sscanf(line + 2, "%u %d %d", &idx, &key, &val) == 3) {
+            add_k(idx, key, val);
+        } else if (line[0] == 'E' && sscanf(line + 2, "%u %40s", &idx, hex) == 2 && strlen(hex) >= 40) {
+            Uint8 b[20];
+            for (int i = 0; i < 20; i++) {
+                unsigned v = 0;
+                char t[3] = {hex[i * 2], hex[i * 2 + 1], 0};
+                sscanf(t, "%x", &v);
+                b[i] = (Uint8)v;
+            }
+            add_e(idx, b);
+        }
+    }
+    fclose(f);
+}
+
+/* ---- IAT-koukut: haetaan pääohjelman tuonneista funktio nimellä ---- */
+static int hook_iat(const char *fn, void *nf, void **orig) {
+    BYTE *b = (BYTE *)GetModuleHandleA(NULL);
+    DWORD lfanew = *(DWORD *)(b + 0x3C);
+    BYTE *nt = b + lfanew;
+    DWORD rva = *(DWORD *)(nt + 128); /* tuontitaulun RVA (PE32) */
+    if (!rva) return 0;
+    DWORD *d = (DWORD *)(b + rva);
+    for (; d[3]; d += 5) { /* Name != 0 */
+        DWORD *ot = (DWORD *)(b + (d[0] ? d[0] : d[4]));
+        DWORD *ft = (DWORD *)(b + d[4]);
+        for (; *ot; ot++, ft++) {
+            if (*ot & 0x80000000u) continue;
+            const char *nm = (const char *)(b + *ot + 2);
+            if (strcmp(nm, fn) == 0) {
+                DWORD old;
+                VirtualProtect(ft, sizeof(DWORD), PAGE_READWRITE, &old);
+                if (orig) *orig = (void *)(*ft);
+                *ft = (DWORD)nf;
+                VirtualProtect(ft, sizeof(DWORD), old, &old);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static void (*o_srand)(unsigned);
+static void h_srand(unsigned s) {
+    cSrand++;
+    if (LG) { fprintf(LG, "srand(%u) -> kaytetaan %u\n", s, SEED ? SEED : s); fflush(LG); }
+    o_srand(SEED ? SEED : s);
+}
+static int (*o_rand)(void);
+static int h_rand(void) { cRand++; return o_rand(); }
+static long long (*o_time64)(long long *);
+static long long h_time64(long long *t) { cTime++; return o_time64(t); }
+static int(__stdcall *o_qpc)(void *);
+static int __stdcall h_qpc(void *p) { cQpc++; return o_qpc(p); }
+static void(__stdcall *o_gst)(void *);
+static void __stdcall h_gst(void *p) { cGst++; o_gst(p); }
+static void(__stdcall *o_gstft)(void *);
+static void __stdcall h_gstft(void *p) { cGstft++; o_gstft(p); }
+
+static void init(void) {
+    char path[MAX_PATH];
+    DWORD err1 = 0, err2 = 0;
+    if (R) return;
+    path[0] = 0;
+    LG = fopen("gr_log.txt", "w");
+    R = GetModuleHandleA("SDL_real.dll");
+    if (!R && GetModuleFileNameA(hSelf, path, MAX_PATH)) {
+        char *s = strrchr(path, '\\');
+        if (!s) s = strrchr(path, '/');
+        if (s) strcpy(s + 1, "SDL_real.dll");
+        R = LoadLibraryA(path);
+        if (!R) err1 = GetLastError();
+    }
+    if (!R) {
+        R = LoadLibraryA("SDL_real.dll");
+        if (!R) err2 = GetLastError();
+    }
+    if (R) {
+        r_GetTicks = (Uint32(*)(void))GetProcAddress(R, "SDL_GetTicks");
+        r_Delay = (void (*)(Uint32))GetProcAddress(R, "SDL_Delay");
+        r_GetKeyState = (Uint8 * (*)(int *)) GetProcAddress(R, "SDL_GetKeyState");
+        r_PollEvent = (int (*)(void *))GetProcAddress(R, "SDL_PollEvent");
+        r_PumpEvents = (void (*)(void))GetProcAddress(R, "SDL_PumpEvents");
+        r_Flip = (int (*)(void *))GetProcAddress(R, "SDL_Flip");
+    }
+    load_cfg();
+    if (MODE == 3) { /* auto: jos gr_keys.txt on olemassa, toista; muuten nauhoita */
+        FILE *t = fopen("gr_keys.txt", "r");
+        if (t) { fclose(t); MODE = 2; } else MODE = 1;
+    }
+    int h1 = hook_iat("srand", (void *)h_srand, (void **)&o_srand);
+    int h2 = hook_iat("rand", (void *)h_rand, (void **)&o_rand);
+    int h3 = hook_iat("_time64", (void *)h_time64, (void **)&o_time64);
+    int h4 = hook_iat("QueryPerformanceCounter", (void *)h_qpc, (void **)&o_qpc);
+    int h5 = hook_iat("GetSystemTime", (void *)h_gst, (void **)&o_gst);
+    int h6 = hook_iat("GetSystemTimeAsFileTime", (void *)h_gstft, (void **)&o_gstft);
+    if (MODE == 1) KF = fopen("gr_keys.txt", "w");
+    if (MODE == 2) load_replay();
+    if (LG) {
+        fprintf(LG, "tried path: %s | error1=%lu error2=%lu\n", path, (unsigned long)err1, (unsigned long)err2);
+        fprintf(LG, "proxy start v3 (call-counter replay), real SDL loaded: %s | mode=%d vclock=%d seed=%u\n", R ? "yes" : "NO", MODE, VCLOCK, SEED);
+        fprintf(LG, "hooks srand=%d rand=%d _time64=%d QPC=%d GetSystemTime=%d GetSystemTimeAsFileTime=%d\n", h1, h2, h3, h4, h5, h6);
+        if (MODE == 2) fprintf(LG, "replay loaded: %u key records, %u event records\n", nk, ne);
+        fflush(LG);
+    }
+    lastRep = GetTickCount();
+}
+
+static void report(void) {
+    DWORD n = GetTickCount();
+    if (n - lastRep < 1000 || !LG) return;
+    fprintf(LG,
+            "[sec] poll#=%u V=%u | GetTicks=%u Delay=%u GetKeyState=%u PollEvent=%u Flip=%u"
+            " | srand=%u rand=%u time64=%u QPC=%u GetSysTime=%u GetSysTimeFT=%u\n",
+            pollIdx, V, cGetTicks, cDelay, cGetKey, cPoll, cFlip, cSrand, cRand, cTime, cQpc, cGst, cGstft);
+    fflush(LG);
+    if (KF) fflush(KF);
+    cGetTicks = cDelay = cGetKey = cPoll = cPump = cFlip = 0;
+    cSrand = cRand = cTime = cQpc = cGst = cGstft = 0;
+    lastRep = n;
+}
+
+EXP Uint32 SDL_GetTicks(void) {
+    init();
+    S++;
+    cGetTicks++;
+    if (!VCLOCK) return r_GetTicks();
+    if (++stuck > 3000) { V += 1; stuck = 0; } /* suojaus: odotussilmukka ilman Delayta */
+    return V;
+}
+
+EXP void SDL_Delay(Uint32 ms) {
+    init();
+    S++;
+    cDelay++;
+    if (LG && delayLogged < 20) {
+        fprintf(LG, "Delay(%u) at V=%u\n", ms, V);
+        delayLogged++;
+    }
+    V += ms;
+    stuck = 0;
+    r_Delay(ms);
+    report();
+}
+
+EXP Uint8 *SDL_GetKeyState(int *numkeys) {
+    init();
+    S++;
+    cGetKey++;
+    pollIdx++;
+    int n0 = 0;
+    Uint8 *k = r_GetKeyState(&n0);
+    if (MODE == 2) {
+        while (rk < nk && krec[rk].idx <= S) {
+            if (krec[rk].key >= 0 && krec[rk].key < 512) repKeys[krec[rk].key] = (Uint8)krec[rk].val;
+            rk++;
+        }
+        if (numkeys) *numkeys = 323;
+        report();
+        return repKeys;
+    }
+    if (numkeys) *numkeys = n0;
+    if (k) {
+        int n = (n0 > 0 && n0 <= 512) ? n0 : 323;
+        for (int i = 0; i < n; i++) {
+            if (k[i] != prevKeys[i]) {
+                if (KF) fprintf(KF, "K %u %d %d\n", S, i, k[i]);
+                if (LG) fprintf(LG, "key %d -> %d at poll %u S=%u\n", i, k[i], pollIdx, S);
+                prevKeys[i] = k[i];
+            }
+        }
+    }
+    report();
+    return k;
+}
+
+EXP int SDL_PollEvent(void *e) {
+    init();
+    S++;
+    cPoll++;
+    int r = r_PollEvent(e);
+    if (MODE == 2) {
+        if (r && e && *(Uint8 *)e == 12) return 1; /* SDL_QUIT sallitaan aina */
+        if (re < ne && erec[re].idx <= S && e) {
+            memcpy(e, erec[re].b, 20);
+            re++;
+            return 1;
+        }
+        return 0;
+    }
+    if (r && e && KF) {
+        fprintf(KF, "E %u ", S);
+        for (int i = 0; i < 20; i++) fprintf(KF, "%02x", ((Uint8 *)e)[i]);
+        fprintf(KF, "\n");
+    }
+    return r;
+}
+
+EXP void SDL_PumpEvents(void) {
+    init();
+    S++;
+    cPump++;
+    r_PumpEvents();
+}
+
+static Uint32 fnv(const Uint8 *p, unsigned n, Uint32 h) {
+    for (unsigned i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+    return h;
+}
+
+EXP int SDL_Flip(void *s) {
+    init();
+    S++;
+    cFlip++;
+    frameNo++;
+    if (LG && s && (frameNo % 5) == 0) {
+        Uint8 *sb = (Uint8 *)s;
+        Uint8 *fmt = *(Uint8 **)(sb + 4);
+        int w = *(int *)(sb + 8), h = *(int *)(sb + 12);
+        unsigned pitch = *(unsigned short *)(sb + 16);
+        Uint8 *px = *(Uint8 **)(sb + 20);
+        if (fmt && px && w > 0 && h > 0 && w < 4096 && h < 4096) {
+            unsigned bpp = fmt[5];
+            Uint32 hh = 2166136261u;
+            for (int y = 0; y < h; y += 3) hh = fnv(px + (unsigned)y * pitch, (unsigned)w * bpp, hh);
+            fprintf(LG, "H frame=%u poll=%u S=%u hash=%08x\n", frameNo, pollIdx, S, hh);
+        }
+    }
+    return r_Flip(s);
+}
