@@ -2,6 +2,8 @@
    Alkuperäinen SDL.dll nimetään SDL_real.dll:ksi, tämä tiedosto on uusi SDL.dll.
    Asetukset: tiedosto gr_net.cfg pelin kansiossa (rivit: mode=off|record|replay, seed=12345, clock=real).
    Lokit: gr_log.txt, nauhoitus: gr_keys.txt. */
+#define WIN32_LEAN_AND_MEAN
+#include "net.h"
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
@@ -27,6 +29,14 @@ static int (*r_PollEvent)(void *);
 static void (*r_PumpEvents)(void);
 static int (*r_Flip)(void *);
 static int (*r_OpenAudio)(void *, void *);
+static char NET_ROOM[48] = "kokeilu1";
+static char NET_BROKER[96] = "broker.hivemq.com";
+static int NET_PORT = 1883, NET_DELAY = 8, NET_WAIT = 1800; /* odotus sekunteina */
+static Uint8 netKeys[512];
+static unsigned char evq[512][20];
+static unsigned evh, evt;
+static unsigned netTick, nextTickV;
+static NIn carry;
 static int AUDIO_OFF = 1; /* v4: aani pois oletuksena (audio=on gr_net.cfg:ssa palauttaa) */
 static FILE *TR;
 static unsigned totRand;
@@ -75,6 +85,12 @@ static void load_cfg(void) {
         else if (!strncmp(line, "mode=replay", 11)) MODE = 2;
         else if (!strncmp(line, "clock=real", 10)) VCLOCK = 0;
         else if (!strncmp(line, "audio=on", 8)) AUDIO_OFF = 0;
+        else if (!strncmp(line, "mode=net", 8)) MODE = 4;
+        else if (!strncmp(line, "room=", 5)) { sscanf(line + 5, "%47s", NET_ROOM); }
+        else if (!strncmp(line, "broker=", 7)) { sscanf(line + 7, "%95s", NET_BROKER); }
+        else if (!strncmp(line, "port=", 5)) NET_PORT = atoi(line + 5);
+        else if (!strncmp(line, "delay=", 6)) NET_DELAY = atoi(line + 6);
+        else if (!strncmp(line, "wait=", 5)) NET_WAIT = atoi(line + 5);
         else if (!strncmp(line, "seed=", 5)) SEED = (unsigned)atoi(line + 5);
     }
     fclose(f);
@@ -179,6 +195,13 @@ static void init(void) {
         FILE *t = fopen("gr_keys.txt", "r");
         if (t) { fclose(t); MODE = 2; } else MODE = 1;
     }
+    if (MODE == 4) {
+        if (LG) { fprintf(LG, "net: yhdistetaan, huone=%s valittaja=%s:%d viive=%d tikkia\n", NET_ROOM, NET_BROKER, NET_PORT, NET_DELAY); fflush(LG); }
+        if (!net_start(NET_BROKER, NET_PORT, NET_ROOM, NET_DELAY, LG, NET_WAIT * 1000)) {
+            if (LG) { fprintf(LG, "net: yhteys epaonnistui -> offline\n"); fflush(LG); }
+            MODE = 0;
+        } else { nextTickV = V + 16; }
+    }
     int h1 = hook_iat("srand", (void *)h_srand, (void **)&o_srand);
     int h2 = hook_iat("rand", (void *)h_rand, (void **)&o_rand);
     int h3 = hook_iat("_time64", (void *)h_time64, (void **)&o_time64);
@@ -187,10 +210,10 @@ static void init(void) {
     int h6 = hook_iat("GetSystemTimeAsFileTime", (void *)h_gstft, (void **)&o_gstft);
     if (MODE == 1) KF = fopen("gr_keys.txt", "w");
     if (MODE == 2) load_replay();
-    TR = fopen(MODE == 2 ? "gr_trace_rep.txt" : "gr_trace_rec.txt", "w");
+    TR = fopen(MODE == 2 ? "gr_trace_rep.txt" : (MODE == 4 ? "gr_trace_net.txt" : "gr_trace_rec.txt"), "w");
     if (LG) {
         fprintf(LG, "tried path: %s | error1=%lu error2=%lu\n", path, (unsigned long)err1, (unsigned long)err2);
-        fprintf(LG, "proxy start v4 (audio=%s, trace), real SDL loaded: %s | mode=%d vclock=%d seed=%u\n", AUDIO_OFF ? "off" : "on", R ? "yes" : "NO", MODE, VCLOCK, SEED);
+        fprintf(LG, "proxy start v5 (verkko, audio=%s), real SDL loaded: %s | mode=%d vclock=%d seed=%u\n", AUDIO_OFF ? "off" : "on", R ? "yes" : "NO", MODE, VCLOCK, SEED);
         fprintf(LG, "hooks srand=%d rand=%d _time64=%d QPC=%d GetSystemTime=%d GetSystemTimeAsFileTime=%d\n", h1, h2, h3, h4, h5, h6);
         if (MODE == 2) fprintf(LG, "replay loaded: %u key records, %u event records\n", nk, ne);
         fflush(LG);
@@ -209,8 +232,67 @@ static void report(void) {
     if (KF) fflush(KF);
     if (TR) fflush(TR);
     cGetTicks = cDelay = cGetKey = cPoll = cPump = cFlip = 0;
+    if (MODE == 4) fprintf(LG, "net: tikki=%u stalls=%u rx=%u tx=%u\n", netTick, n_stalls, n_rx_msgs, n_tx_msgs);
     cSrand = cRand = cTime = cQpc = cGst = cGstft = 0;
     lastRep = n;
+}
+
+/* ---- verkkopeli (lockstep) ---- */
+static int net_idle(void *u) {
+    Uint8 ev[32];
+    (void)u;
+    r_PumpEvents();
+    while (r_PollEvent(ev)) {
+        if (ev[0] == 12) ExitProcess(0);
+        if (ev[0] != 1 && ev[0] != 17 && carry.nev < NET_MAXE) memcpy(carry.ev[carry.nev++], ev, 20);
+    }
+    return 0;
+}
+
+static void net_sample(NIn *o) {
+    int n0 = 0, i;
+    Uint8 ev[32];
+    Uint8 *k;
+    memset(o, 0, sizeof *o);
+    r_PumpEvents();
+    k = r_GetKeyState(&n0);
+    if (k) {
+        if (n0 > 512) n0 = 512;
+        for (i = 0; i < n0 && o->nk < NET_MAXK; i++) if (k[i]) o->k[o->nk++] = (unsigned short)i;
+    }
+    for (i = 0; i < carry.nev; i++) memcpy(o->ev[o->nev++], carry.ev[i], 20);
+    carry.nev = 0;
+    while (r_PollEvent(ev)) {
+        if (ev[0] == 1 || ev[0] == 17) continue;
+        if (o->nev >= NET_MAXE) continue;
+        if (ev[0] == 4 && o->nev >= NET_MAXE - 2) continue;
+        memcpy(o->ev[o->nev++], ev, 20);
+    }
+}
+
+static void net_apply(const NIn *a, const NIn *b) {
+    int i, j;
+    const NIn *x[2];
+    x[0] = a; x[1] = b;
+    memset(netKeys, 0, sizeof netKeys);
+    for (j = 0; j < 2; j++) {
+        for (i = 0; i < x[j]->nk; i++) if (x[j]->k[i] < 512) netKeys[x[j]->k[i]] = 1;
+        for (i = 0; i < x[j]->nev; i++) {
+            memcpy(evq[evt & 511], x[j]->ev[i], 20);
+            evt++;
+        }
+    }
+}
+
+static void net_tick(void) {
+    while (MODE == 4 && V >= nextTickV) {
+        NIn sm, h, g;
+        nextTickV += 16;
+        netTick++;
+        net_sample(&sm);
+        if (net_step(netTick, &sm, &h, &g, net_idle, 0)) ExitProcess(0);
+        net_apply(&h, &g);
+    }
 }
 
 EXP Uint32 SDL_GetTicks(void) {
@@ -220,6 +302,7 @@ EXP Uint32 SDL_GetTicks(void) {
     cGetTicks++;
     if (!VCLOCK) return r_GetTicks();
     if (++stuck > 3000) { V += 1; stuck = 0; } /* suojaus: odotussilmukka ilman Delayta */
+    if (MODE == 4) net_tick();
     return V;
 }
 
@@ -234,6 +317,7 @@ EXP void SDL_Delay(Uint32 ms) {
     }
     V += ms;
     stuck = 0;
+    if (MODE == 4) net_tick();
     r_Delay(ms);
     report();
 }
@@ -245,7 +329,13 @@ EXP Uint8 *SDL_GetKeyState(int *numkeys) {
     cGetKey++;
     pollIdx++;
     int n0 = 0;
-    Uint8 *k = r_GetKeyState(&n0);
+    Uint8 *k;
+    if (MODE == 4) {
+        if (numkeys) *numkeys = 323;
+        report();
+        return netKeys;
+    }
+    k = r_GetKeyState(&n0);
     if (MODE == 2) {
         while (rk < nk && krec[rk].idx <= S) {
             if (krec[rk].key >= 0 && krec[rk].key < 512) repKeys[krec[rk].key] = (Uint8)krec[rk].val;
@@ -271,6 +361,74 @@ EXP Uint8 *SDL_GetKeyState(int *numkeys) {
 }
 
 EXP int SDL_PollEvent(void *e) {
+    init();
+    S++;
+    TRACE('P');
+    cPoll++;
+    int r;
+    if (MODE == 4) {
+        if (e && evh != evt) { memcpy(e, evq[evh & 511], 20); evh++; return 1; }
+        return 0;
+    }
+    r = r_PollEvent(e);
+    if (MODE == 2) {
+        if (r && e && *(Uint8 *)e == 12) return 1; /* SDL_QUIT sallitaan aina */
+        if (re < ne && erec[re].idx <= S && e) {
+            memcpy(e, erec[re].b, 20);
+            re++;
+            return 1;
+        }
+        return 0;
+    }
+    if (r && e && KF) {
+        fprintf(KF, "E %u ", S);
+        for (int i = 0; i < 20; i++) fprintf(KF, "%02x", ((Uint8 *)e)[i]);
+        fprintf(KF, "\n");
+    }
+    return r;
+}
+
+EXP int SDL_OpenAudio(void *d, void *o) {
+    init();
+    if (AUDIO_OFF) { if (LG) { fprintf(LG, "SDL_OpenAudio estetty (audio=off)\n"); fflush(LG); } return -1; }
+    return r_OpenAudio(d, o);
+}
+
+EXP void SDL_PumpEvents(void) {
+    init();
+    S++;
+    TRACE('U');
+    cPump++;
+    r_PumpEvents();
+}
+
+static Uint32 fnv(const Uint8 *p, unsigned n, Uint32 h) {
+    for (unsigned i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+    return h;
+}
+
+EXP int SDL_Flip(void *s) {
+    init();
+    S++;
+    TRACE('F');
+    cFlip++;
+    frameNo++;
+    if (LG && s && (frameNo % 5) == 0) {
+        Uint8 *sb = (Uint8 *)s;
+        Uint8 *fmt = *(Uint8 **)(sb + 4);
+        int w = *(int *)(sb + 8), h = *(int *)(sb + 12);
+        unsigned pitch = *(unsigned short *)(sb + 16);
+        Uint8 *px = *(Uint8 **)(sb + 20);
+        if (fmt && px && w > 0 && h > 0 && w < 4096 && h < 4096) {
+            unsigned bpp = fmt[5];
+            Uint32 hh = 2166136261u;
+            for (int y = 0; y < h; y += 3) hh = fnv(px + (unsigned)y * pitch, (unsigned)w * bpp, hh);
+            fprintf(LG, "H frame=%u poll=%u S=%u hash=%08x\n", frameNo, pollIdx, S, hh);
+        }
+    }
+    return r_Flip(s);
+}
+t SDL_PollEvent(void *e) {
     init();
     S++;
     TRACE('P');
