@@ -37,6 +37,8 @@ static unsigned char evq[512][20];
 static unsigned evh, evt;
 static unsigned netTick, nextTickV;
 static NIn carry;
+static int remapFrom[32] = {119, 115, 97, 100}, remapTo[32] = {273, 274, 276, 275}; /* vieraan w,s,a,d -> nuolet */
+static int nRemap = 4;
 static int AUDIO_OFF = 1; /* v4: aani pois oletuksena (audio=on gr_net.cfg:ssa palauttaa) */
 static FILE *TR;
 static unsigned totRand;
@@ -91,6 +93,17 @@ static void load_cfg(void) {
         else if (!strncmp(line, "port=", 5)) NET_PORT = atoi(line + 5);
         else if (!strncmp(line, "delay=", 6)) NET_DELAY = atoi(line + 6);
         else if (!strncmp(line, "wait=", 5)) NET_WAIT = atoi(line + 5);
+        else if (!strncmp(line, "remap=", 6)) {
+            /* remap=119:273,115:274,... (vieraan nappi:pelin nappi); remap=none poistaa */
+            char *q = line + 6;
+            int a, b, used;
+            nRemap = 0;
+            while (nRemap < 32 && sscanf(q, "%d:%d%n", &a, &b, &used) == 2) {
+                remapFrom[nRemap] = a; remapTo[nRemap] = b; nRemap++;
+                q += used;
+                if (*q == ',') q++;
+            }
+        }
         else if (!strncmp(line, "seed=", 5)) SEED = (unsigned)atoi(line + 5);
     }
     fclose(f);
@@ -276,7 +289,11 @@ static void net_apply(const NIn *a, const NIn *b) {
     x[0] = a; x[1] = b;
     memset(netKeys, 0, sizeof netKeys);
     for (j = 0; j < 2; j++) {
-        for (i = 0; i < x[j]->nk; i++) if (x[j]->k[i] < 512) netKeys[x[j]->k[i]] = 1;
+        for (i = 0; i < x[j]->nk; i++) {
+            int kk = x[j]->k[i], m;
+            if (j == 1) for (m = 0; m < nRemap; m++) if (remapFrom[m] == kk) { kk = remapTo[m]; break; }
+            if (kk >= 0 && kk < 512) netKeys[kk] = 1;
+        }
         for (i = 0; i < x[j]->nev; i++) {
             memcpy(evq[evt & 511], x[j]->ev[i], 20);
             evt++;
