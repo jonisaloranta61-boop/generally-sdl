@@ -1,0 +1,59 @@
+name: apk
+on: workflow_dispatch
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Tyokalut
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-i686 unzip zip
+      - name: Rakenna SDL-proxy
+        run: |
+          echo "EXPORTS" > SDL.def
+          for f in SDL_GetTicks SDL_Delay SDL_GetKeyState SDL_PollEvent SDL_PumpEvents SDL_Flip SDL_OpenAudio; do
+            echo "  $f" >> SDL.def
+          done
+          for f in SDL_PushEvent SDL_Quit SDL_WM_SetCaption SDL_Init SDL_JoystickOpened SDL_JoystickNumButtons SDL_JoystickGetHat SDL_JoystickNumHats SDL_JoystickNumAxes SDL_JoystickGetButton SDL_JoystickOpen SDL_NumJoysticks SDL_JoystickGetAxis SDL_DisplayFormat SDL_PauseAudio SDL_CloseAudio SDL_ConvertAudio SDL_LoadWAV_RW SDL_BuildAudioCVT SDL_FreeWAV SDL_RWFromFile SDL_FillRect SDL_SetVideoMode SDL_UpperBlit SDL_SetPalette SDL_ShowCursor SDL_SaveBMP_RW SDL_GetVideoSurface SDL_DisplayFormatAlpha SDL_ConvertSurface SDL_GetRGBA SDL_CreateRGBSurface SDL_SetAlpha SDL_FreeSurface SDL_LockSurface SDL_UnlockSurface; do
+            echo "  $f = SDL_real.$f" >> SDL.def
+          done
+          i686-w64-mingw32-gcc -O2 -shared -static-libgcc -o SDL_proxy.dll proxy.c SDL.def -lws2_32
+      - name: Pelipaketti
+        run: |
+          mkdir pack
+          unzip -q GeneRally_12d.zip -d pack
+          GAMEEXE=$(find pack -iname GeneRally.exe | head -1)
+          GAMEDIR=$(dirname "$GAMEEXE")
+          mv "$GAMEDIR/SDL.dll" "$GAMEDIR/SDL_real.dll"
+          cp SDL_proxy.dll "$GAMEDIR/SDL.dll"
+          (cd "$GAMEDIR" && zip -qr "$GITHUB_WORKSPACE/generally.zip" .)
+          ls -la generally.zip
+      - name: Winlator-lahdekoodi
+        run: |
+          mkdir wl && cd wl
+          git init -q
+          git remote add origin https://github.com/brunodev85/winlator-app
+          git fetch -q --depth 1 origin ecd5ab2980de79eb955621cef26a3b4672013875
+          git checkout -q FETCH_HEAD
+      - name: Muokkaa
+        run: |
+          cp AutoGame.java wl/app/src/main/java/com/winlator/
+          cp generally.zip wl/app/src/main/assets/
+          cp gr_profile.icp wl/app/src/main/assets/
+          python3 patch.py wl
+      - name: Android SDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" "ndk;24.0.8215888" "cmake;3.22.1"
+      - name: Rakenna APK
+        working-directory: wl
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GeneRally-APK
+          path: wl/app/build/outputs/apk/debug/*.apk
