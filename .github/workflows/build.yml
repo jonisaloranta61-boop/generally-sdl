@@ -9,10 +9,10 @@ jobs:
       - name: Tee def-tiedosto
         run: |
           echo "EXPORTS" > SDL.def
-          for f in SDL_GetTicks SDL_Delay SDL_GetKeyState SDL_PollEvent SDL_PumpEvents SDL_Flip; do
+          for f in SDL_GetTicks SDL_Delay SDL_GetKeyState SDL_PollEvent SDL_PumpEvents SDL_Flip SDL_OpenAudio; do
             echo "  $f" >> SDL.def
           done
-          for f in SDL_PushEvent SDL_Quit SDL_WM_SetCaption SDL_Init SDL_JoystickOpened SDL_JoystickNumButtons SDL_JoystickGetHat SDL_JoystickNumHats SDL_JoystickNumAxes SDL_JoystickGetButton SDL_JoystickOpen SDL_NumJoysticks SDL_JoystickGetAxis SDL_DisplayFormat SDL_OpenAudio SDL_PauseAudio SDL_CloseAudio SDL_ConvertAudio SDL_LoadWAV_RW SDL_BuildAudioCVT SDL_FreeWAV SDL_RWFromFile SDL_FillRect SDL_SetVideoMode SDL_UpperBlit SDL_SetPalette SDL_ShowCursor SDL_SaveBMP_RW SDL_GetVideoSurface SDL_DisplayFormatAlpha SDL_ConvertSurface SDL_GetRGBA SDL_CreateRGBSurface SDL_SetAlpha SDL_FreeSurface SDL_LockSurface SDL_UnlockSurface; do
+          for f in SDL_PushEvent SDL_Quit SDL_WM_SetCaption SDL_Init SDL_JoystickOpened SDL_JoystickNumButtons SDL_JoystickGetHat SDL_JoystickNumHats SDL_JoystickNumAxes SDL_JoystickGetButton SDL_JoystickOpen SDL_NumJoysticks SDL_JoystickGetAxis SDL_DisplayFormat SDL_PauseAudio SDL_CloseAudio SDL_ConvertAudio SDL_LoadWAV_RW SDL_BuildAudioCVT SDL_FreeWAV SDL_RWFromFile SDL_FillRect SDL_SetVideoMode SDL_UpperBlit SDL_SetPalette SDL_ShowCursor SDL_SaveBMP_RW SDL_GetVideoSurface SDL_DisplayFormatAlpha SDL_ConvertSurface SDL_GetRGBA SDL_CreateRGBSurface SDL_SetAlpha SDL_FreeSurface SDL_LockSurface SDL_UnlockSurface; do
             echo "  $f = SDL_real.$f" >> SDL.def
           done
           cat SDL.def
@@ -21,3 +21,4 @@ jobs:
         with:
           name: SDL-proxy
           path: SDL.dll
+          
